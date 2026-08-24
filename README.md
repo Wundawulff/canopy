@@ -1,110 +1,118 @@
-<img src="./canopy-logo-white-bg.svg" alt="Canopy Logo" width="500"/>
+# ANIMI Chain
 
-_Official golang implementation of the Canopy Network Protocol_
+A registry and ranking layer for AI-generated images and short video, built as a
+Canopy appchain on the Python plugin.
 
-[![GoDoc](https://img.shields.io/badge/godoc-reference-white.svg)](https://godoc.org/github.com/canopy-network/canopy)
-[![Getting Started](https://img.shields.io/badge/getting%20started-guide-white)](https://canopynetwork.org)
-[![Go Version](https://img.shields.io/badge/golang-v1.21-white.svg)](https://golang.org)
-[![Next.js Version](https://img.shields.io/badge/next%20js-v14.2.3-white.svg)](https://nextjs.org/)
+The chain stores **proof, not payload**. A work is identified by the SHA-256 hash
+of its source file; the file itself lives off-chain behind an IPFS or HTTPS
+pointer and never enters chain state.
 
+---
 
-# Overview
+## Why this exists
 
-[![License](https://img.shields.io/badge/License-MIT-white.svg)](https://opensource.org/licenses/MIT)
-[![Testing](https://img.shields.io/badge/testing-docker%20compose-white)](https://docs.docker.com/compose/)
-[![Platform](https://img.shields.io/badge/platform-linux%20%7C%20macos-white.svg)](https://github.com/canopy-network/canopy/releases)
-[![Status](https://img.shields.io/badge/status-alphanet-white)](https://docs.docker.com/compose/)
+Ranking systems for generated content have a structural problem: if an
+endorsement is free, it is free to manufacture. One script can hold thousands of
+addresses, and a ranking that costs nothing to move is not a signal.
 
-### ⫸ **Welcome to the Network that Powers the Peer-to-Peer Launchpad for New Chains**
+ANIMI prices the endorsement instead. Every vote carries a transfer that settles
+into the creator's account. Manufacturing a ranking therefore requires a real
+balance, and the spend lands with the author rather than being burned.
 
-Built on a recursive architecture, chains bootstrap each other into independence —  
-forming an `unstoppable` web of utility and security. 
+---
 
-**Here you'll find:**
+## Design
 
-➪ A recursive framework to build blockchains.
+| | |
+|---|---|
+| Base | Canopy Python plugin (`plugin/python`) |
+| Custom transactions | `submit`, `vote` |
+| Custom state prefixes | `100` (Submission), `101` (Vote) |
+| Media storage | Off-chain, referenced by hash + URI |
 
-➪ The seed chain that started the recursive cycle.
+### `submit`
 
-For more information on the Canopy Network Protocol visit [https://canopynetwork.org](https://canopynetwork.org)
+Registers a work. Validated statelessly in `check_tx`:
 
-## Standard
+- `creator_address` must be 20 bytes
+- `content_hash` must be exactly 32 bytes (a real SHA-256)
+- `media_uri` must be non-empty, at most 256 chars, and start with `ipfs://` or `https://`
+- `media_type` must be `0` (image) or `1` (video)
+- `title` must be non-empty and at most 100 chars
 
-➪ Canopy is an Ethereum-RPC compatible L1 for native transfers, so it can plug into existing Ethereum exchange, wallet, and indexer tooling,
-  including MetaMask. Use the `/v1/eth` endpoint as a custom Ethereum RPC and review the compatibility notes in the [eth-spec](./fsm/ethereum.md)
+In `deliver_tx`, a `content_hash` that already exists is rejected, so the same
+file cannot be registered twice.
 
-## RPC
+### `vote`
 
-➪ [Full RPC Specification](./cmd/rpc/README.md)
+Records an endorsement and transfers the attached amount to the creator.
+Enforced in `deliver_tx`:
 
-## Protocol Documentation
+- the referenced submission must exist
+- the `(content_hash, voter_address)` record must not already exist — one address, one vote per work
+- the creator cannot vote on their own entry
+- the voter's balance must cover `amount + fee`
+- every accumulation is checked against `UINT64_MAX` before it is applied
 
-➪ Check out the Canopy Network wiki:  [https://canopy-network.gitbook.io/docs](https://canopy-network.gitbook.io/docs)
+Double-voting is prevented structurally rather than by a counter: the state key
+`prefix(101) || content_hash || voter_address` either exists or it does not.
 
-## Repository Documentation
+---
 
-Welcome to the Canopy Network reference implementation. This repository can be well understood reading about the core modules:
+## State layout
 
-- [Controller](controller/README.md): Coordinates communication between all the major parts of the Canopy blockchain, like a central hub or "bus" that connects the system together.
-- [Finite State Machine (FSM)](fsm/README.md): Defines the logic for how transactions change the blockchain's state — it decides what’s valid and how state transitions happen from one block to the next.
-- [Byzantine Fault Tolerant (BFT) Consensus](bft/README.md): A consensus mechanism that allows the network to agree on new blocks even if some nodes are unreliable or malicious.
-- [Peer-to-Peer Networking](p2p/README.md): A secure and encrypted communication system that lets nodes talk directly to each other without needing a central server.
-- [Persistence](store/README.md): Manages the blockchain’s storage — it saves the current state (ledger), indexes past transactions, and ensures fast and reliable data verification.
+Canopy reserves single-byte prefixes `1-15` for core state and panics at
+handshake if a plugin declares a colliding prefix. ANIMI therefore uses `100`
+and `101`, both declared in `CONTRACT_CONFIG["custom_state_prefixes"]`.
 
-## How to Run It
-
-➪ To run the Canopy binary, use the following commands:
-
-```bash
-make build/canopy-full
-canopy start
+```
+100 || content_hash                    -> Submission
+101 || content_hash || voter_address   -> Vote
 ```
 
-## How to Run It with 🐳 Docker
+`Submission` carries the creator address, media pointer, media type, title,
+creation height, vote count and cumulative amount received.
 
-➪ To run a Canopy `Localnet` in a *containerized* environment, use the following commands:
-```bash
-make docker/build
-make docker/up-fast
-make docker/logs
+---
 
-or simply
-
-make docker/up && make docker/logs
-```
-
-## Running Tests
-
-➪ To run Canopy unit tests, use the Go testing tools:
+## Build and test
 
 ```bash
-make test
+cd plugin/python
+make proto          # regenerate protobuf bindings after editing tx.proto
+python -m pytest tests/test_animi.py -q
 ```
 
-## How to Contribute
+`tests/test_animi.py` runs the contract against an in-memory state store and
+covers the validation rules, the duplicate guard, the double-vote guard, the
+self-vote guard, balance accounting and fee-pool accounting.
 
-➪ Canopy is an open-source project, and we welcome contributions from the community. Here's how to get involved:
+> Note: `tests/test_contract.py` from the upstream template fails to import
+> unless the tutorial message types are also generated. That failure predates
+> this fork.
 
-1. **Fork** the repository and clone it locally.
-2. **Code** your improvements or fixes.
-3. **Submit a Pull Request** (PR) for review.
+---
 
-➣ Please follow these [guidelines](CONTRIBUTING.md) to maintain high-quality contributions:
+## Layout
 
-### High Impact or Architectural Changes
+```
+plugin/python/
+  contract/
+    contract.py            # transaction handlers and state keys
+    proto/tx.proto         # MessageSubmit, MessageVote, Submission, Vote
+  tests/test_animi.py      # contract tests
+```
 
-➪ Before making large changes, discuss them with the Canopy team on [Discord](https://discord.gg/pNcSJj7Wdh) to ensure alignment.
+---
 
-### Coding Style
+## Status
 
-- Code must adhere to official Go formatting (use [`gofmt`](https://golang.org/cmd/gofmt)).
-- (Optional) Use [EditorConfig](https://editorconfig.org) for consistent formatting.
-- All code should follow Go documentation/commentary guidelines.
-- PRs should be opened against the `development` branch.
+Testnet. Parameters, fees and the endorsement model are expected to change
+before any mainnet consideration.
 
-[![Pre-Release](https://img.shields.io/github/release-pre/canopy-network/canopy.svg)](https://github.com/canopy-network/canopy/releases)
-[![Contributors](https://img.shields.io/github/contributors/canopy-network/canopy.svg)](https://github.com/canopy-network/canopy/pulse)
-[![Last Commit](https://img.shields.io/github/last-commit/canopy-network/canopy.svg)](https://github.com/canopy-network/canopy/pulse)
+## License
+
+Inherits the license of the upstream Canopy repository.
 
 ## Contact
 
